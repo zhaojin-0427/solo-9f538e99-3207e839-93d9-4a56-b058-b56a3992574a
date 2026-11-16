@@ -11,4 +11,4 @@ export ENABLE_DEMO_RESET="${ENABLE_DEMO_RESET:-1}"
 export PORT="${PORT:-8000}"
 
 mkdir -p "$(dirname "$DB_PATH")" "$DATA_DIR"
-exec python3 run.py
+exec python3 -I run.py  # run.py 会自行把自身目录加入 sys.path

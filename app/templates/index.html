@@ -46,6 +46,9 @@
   <p>挂载目录：<code style="background:#234d75;color:#cfe3ff">{{ data_dir }}</code>　|　仅采集上次成功后新增的完整行，非法内容整轮拒绝</p>
 </header>
 <main>
+  {% if recovery_error %}
+    <div class="flash danger">上次演示重置未能完成收尾，页面显示的是恢复前状态；系统会在下次操作时继续重试：{{ recovery_error }}</div>
+  {% endif %}
   {% with messages = get_flashed_messages(with_categories=true) %}
     {% for category, message in messages %}
       <div class="flash {{ category }}">{{ message }}</div>

@@ -17,6 +17,7 @@ DB_PATH = os.environ.get("DB_PATH", "/instance/fermenter.db")
 ENABLE_DEMO_RESET = os.environ.get("ENABLE_DEMO_RESET", "0") == "1"
 
 _collect_lock = threading.Lock()
+_reset_lock = threading.Lock()
 
 
 def create_app() -> Flask:
@@ -24,6 +25,10 @@ def create_app() -> Flask:
     app.secret_key = os.environ.get("SECRET_KEY", "fermenter-demo-secret-key")
     os.makedirs(DATA_DIR, exist_ok=True)
     collector.init_db(DB_PATH)
+    # 若上次进程在演示重置中途退出，启动时先收尾：只会回到“重置前完整状态”
+    # 或“重置后空状态”，页面与采集都不会看到半清空。
+    collector.recover_incomplete_reset(DB_PATH)
+
     @app.get("/")
     def index():
         try:
@@ -31,12 +36,21 @@ def create_app() -> Flask:
         except (TypeError, ValueError):
             page = 1
         page_size = 25
-        rows, total = collector.list_records(
-            DB_PATH, limit=page_size, offset=(page - 1) * page_size
-        )
-        runs = collector.list_runs(DB_PATH)
-        states = collector.list_file_states(DB_PATH)
-        files = collector._scan_files(DATA_DIR)  # noqa: SLF001 - 展示用
+        recovery_error = ""
+        try:
+            # 若上次进程在重置中途退出（且启动恢复也没能完成），每次打开页面
+            # 都再尝试一次，避免长期停留在半清空状态。
+            collector.recover_incomplete_reset(DB_PATH)
+        except Exception as exc:  # noqa: BLE001 - 页面仍可展示数据库现状
+            recovery_error = f"{type(exc).__name__}: {exc}"
+        # 与重置互斥：页面快照不会跨在“日志已移走、库未清空”之间。
+        with collector.operation_lock():
+            rows, total = collector.list_records(
+                DB_PATH, limit=page_size, offset=(page - 1) * page_size
+            )
+            runs = collector.list_runs(DB_PATH)
+            states = collector.list_file_states(DB_PATH)
+            files = collector._scan_files(DATA_DIR)  # noqa: SLF001 - 展示用
         return render_template(
             "index.html",
             rows=rows,
@@ -48,6 +62,7 @@ def create_app() -> Flask:
             files=files,
             data_dir=DATA_DIR,
             demo_reset=ENABLE_DEMO_RESET,
+            recovery_error=recovery_error,
         )
 
     @app.post("/collect")
@@ -70,6 +85,8 @@ def create_app() -> Flask:
                 ),
                 "success",
             )
+        elif result["status"] == "superseded":
+            flash(result["error"], "warning")
         else:
             level = "danger" if result["status"] == "rejected" else "warning"
             flash(
@@ -83,7 +100,8 @@ def create_app() -> Flask:
 
     @app.get("/records.csv")
     def export_csv():
-        rows, _ = collector.list_records(DB_PATH, limit=10_000_000, offset=0)
+        with collector.operation_lock():
+            rows, _ = collector.list_records(DB_PATH, limit=10_000_000, offset=0)
         buf = io.StringIO()
         writer = csv.writer(buf)
         writer.writerow(["seq", "ts_utc", "temp", "source_file", "inode", "collected_at", "raw"])
@@ -108,8 +126,23 @@ def create_app() -> Flask:
         if not ENABLE_DEMO_RESET:
             flash("演示重置未开启（需 ENABLE_DEMO_RESET=1）。", "warning")
             return redirect(url_for("index"))
-        collector.reset_all(DB_PATH, DATA_DIR)
-        flash("已清空数据库与挂载目录中的日志文件。", "success")
+        if not _reset_lock.acquire(blocking=False):
+            flash("已有一轮演示重置正在执行，请稍后刷新查看结果。", "warning")
+            return redirect(url_for("index"))
+        try:
+            collector.reset_all(DB_PATH, DATA_DIR)
+        except collector.ResetError as exc:
+            flash(str(exc), "danger")
+            return redirect(url_for("index"))
+        except Exception as exc:  # noqa: BLE001 - 不允许把 500 留给页面
+            flash(
+                f"演示重置失败，原有记录与日志保持不变：{type(exc).__name__}: {exc}",
+                "danger",
+            )
+            return redirect(url_for("index"))
+        finally:
+            _reset_lock.release()
+        flash("已同时清空记录、采集进度、采集轮次与两份日志文件。", "success")
         return redirect(url_for("index"))
 
     @app.get("/healthz")

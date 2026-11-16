@@ -4,9 +4,12 @@
 import json
 import os
 import site
+import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
+from unittest import mock
 
 # 兼容 python3 -I（隔离模式会忽略 PYTHONPATH）：允许通过 TEST_SITE 注入依赖路径
 for _p in os.environ.get("TEST_SITE", "").split(os.pathsep):
@@ -283,6 +286,311 @@ class CollectorTest(unittest.TestCase):
             collector.validate_line("[1,2,3]")
 
 
+class ResetAtomicityTest(unittest.TestCase):
+    """演示重置与采集交错、文件/写库失败、中途重启的原子性用例。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.data = os.path.join(self.tmp.name, "data")
+        self.db = os.path.join(self.tmp.name, "db", "reset.db")
+        os.makedirs(self.data, exist_ok=True)
+        self.active = os.path.join(self.data, ACTIVE)
+        self.rotated = os.path.join(self.data, ROTATED)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, path, text, mode="a"):
+        with open(path, mode, encoding="utf-8") as fh:
+            fh.write(text)
+
+    def assert_all_empty(self):
+        self.assertEqual(collector.list_records(self.db)[1], 0)
+        self.assertEqual(collector.list_file_states(self.db), [])
+        self.assertEqual(collector.list_runs(self.db), [])
+        self.assertFalse(os.path.exists(self.active))
+        self.assertFalse(os.path.exists(self.rotated))
+        leftovers = [n for n in os.listdir(self.data) if n != ".gitkeep"]
+        self.assertEqual(leftovers, [])
+
+    def test_reset_clears_records_progress_runs_and_both_logs(self):
+        self.write(self.rotated, rec(1) + "\n" + rec(2) + "\n")
+        self.write(self.active, rec(3) + "\n")
+        self.assertEqual(
+            collector.collect_once(self.data, self.db)["status"], "ok"
+        )
+        self.assertEqual(collector.list_records(self.db)[1], 3)
+        self.assertEqual(len(collector.list_file_states(self.db)), 2)
+        self.assertEqual(len(collector.list_runs(self.db)), 1)
+
+        collector.reset_all(self.db, self.data)
+        self.assert_all_empty()
+        # 重置后采集空目录：正常空操作，轮次从空开始重新记
+        r = collector.collect_once(self.data, self.db)
+        self.assertEqual(r["status"], "ok")
+        self.assertEqual((r["records_inserted"], r["lines_seen"]), (0, 0))
+
+    def test_reset_interleaved_with_inflight_collect_discards_stale_writeback(self):
+        """采集读完日志 -> 重置成功 -> 旧采集不得回写记录/进度/轮次。"""
+        self.write(self.active, rec(1) + "\n" + rec(2) + "\n")
+        real_read = collector._read_file_chunk
+        published = {}
+
+        def read_then_reset(data_dir, info, states):
+            chunk = real_read(data_dir, info, states)
+            if info["name"] == ACTIVE and "done" not in published:
+                published["done"] = True
+                # 模拟网页重置在“刚读完日志、尚未写库”时成功返回
+                collector.reset_all(self.db, self.data)
+                published["reset_epoch"] = collector.current_epoch(self.db)
+            return chunk
+
+        with mock.patch.object(collector, "_read_file_chunk", side_effect=read_then_reset):
+            result = collector.collect_once(self.data, self.db)
+
+        self.assertEqual(published["reset_epoch"], 1)
+        self.assertEqual(result["status"], "superseded")
+        self.assertEqual(result["records_inserted"], 0)
+        self.assert_all_empty()
+
+    def test_reset_interleaved_then_old_collect_still_no_writeback(self):
+        """后台采集线程在重置后完成写库阶段：epoch 复核必须拦住。"""
+        self.write(self.active, rec(1) + "\n")
+        started = threading.Event()
+        release = threading.Event()
+        real_read = collector._read_file_chunk
+
+        def blocking_read(data_dir, info, states):
+            chunk = real_read(data_dir, info, states)
+            if "waited" not in vars(blocking_read):
+                blocking_read.waited = True
+                started.set()
+                release.wait(10)
+            return chunk
+
+        out = {}
+        with mock.patch.object(collector, "_read_file_chunk", side_effect=blocking_read):
+            t = threading.Thread(
+                target=lambda: out.setdefault("r", collector.collect_once(self.data, self.db))
+            )
+            t.start()
+            self.assertTrue(started.wait(10))
+            collector.reset_all(self.db, self.data)
+            release.set()
+            t.join(10)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(out["r"]["status"], "superseded")
+        self.assert_all_empty()
+
+    def test_reset_supersedes_inflight_rejected_round_without_run_row(self):
+        """采集中途重置后，原本会被拒绝/留痕的轮次也不再留下任何轮次。"""
+        self.write(self.active, rec(1) + "\n" + rec(1, 99.0) + "\n")  # 批内冲突
+        started = threading.Event()
+        release = threading.Event()
+        real_read = collector._read_file_chunk
+
+        def blocking_read(data_dir, info, states):
+            chunk = real_read(data_dir, info, states)
+            if "waited" not in vars(blocking_read):
+                blocking_read.waited = True
+                started.set()
+                release.wait(10)
+            return chunk
+
+        out = {}
+        with mock.patch.object(collector, "_read_file_chunk", side_effect=blocking_read):
+            t = threading.Thread(
+                target=lambda: out.setdefault("r", collector.collect_once(self.data, self.db))
+            )
+            t.start()
+            self.assertTrue(started.wait(10))
+            collector.reset_all(self.db, self.data)
+            release.set()
+            t.join(10)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(out["r"]["status"], "superseded")
+        self.assert_all_empty()
+
+    def test_failed_reset_window_also_blocks_inflight_writeback(self):
+        """重置尝试过（文件被移走又回滚）后，读取期间的旧采集也不得写回。"""
+        self.write(self.active, rec(1) + "\n")
+        started = threading.Event()
+        release = threading.Event()
+        real_read = collector._read_file_chunk
+
+        def blocking_read(data_dir, info, states):
+            chunk = real_read(data_dir, info, states)
+            if "waited" not in vars(blocking_read):
+                blocking_read.waited = True
+                started.set()
+                release.wait(10)
+            return chunk
+
+        out = {}
+        with mock.patch.object(collector, "_read_file_chunk", side_effect=blocking_read):
+            t = threading.Thread(
+                target=lambda: out.setdefault("r", collector.collect_once(self.data, self.db))
+            )
+            t.start()
+            self.assertTrue(started.wait(10))
+            with mock.patch.object(
+                collector.os, "replace", side_effect=OSError("disk full (simulated)")
+            ):
+                with self.assertRaises(collector.ResetError):
+                    collector.reset_all(self.db, self.data)
+            release.set()
+            t.join(10)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(out["r"]["status"], "superseded")
+        # 重置失败：日志仍在、记录未被半清空；随后再采集可正常入库
+        self.assertTrue(os.path.exists(self.active))
+        self.assertEqual(collector.list_records(self.db)[1], 0)
+        self.assertEqual(collector.list_runs(self.db), [])
+        r = collector.collect_once(self.data, self.db)
+        self.assertEqual((r["status"], r["records_inserted"]), ("ok", 1))
+
+    def test_reset_file_failure_keeps_records_and_logs(self):
+        """第二份日志移走失败：记录、进度、轮次与两份日志都保持原样。"""
+        self.write(self.rotated, rec(1) + "\n")
+        self.write(self.active, rec(2) + "\n")
+        collector.collect_once(self.data, self.db)
+        before_records = collector.list_records(self.db)[1]
+        before_states = len(collector.list_file_states(self.db))
+        before_runs = len(collector.list_runs(self.db))
+
+        real_replace = os.replace
+
+        def failing_replace(src, dst):
+            if src.endswith(ACTIVE):  # 第一份已移走，第二份失败
+                raise OSError("disk full (simulated)")
+            return real_replace(src, dst)
+
+        with mock.patch.object(collector.os, "replace", side_effect=failing_replace):
+            with self.assertRaises(collector.ResetError):
+                collector.reset_all(self.db, self.data)
+
+        self.assertEqual(collector.list_records(self.db)[1], before_records)
+        self.assertEqual(len(collector.list_file_states(self.db)), before_states)
+        self.assertEqual(len(collector.list_runs(self.db)), before_runs)
+        self.assertTrue(os.path.exists(self.active))
+        self.assertTrue(os.path.exists(self.rotated))
+        self.assertFalse(
+            [n for n in os.listdir(self.data) if n.startswith(".reset-")]
+        )
+        # 原有日志仍可继续正常采集（半行/轮转规则不受影响）
+        self.write(self.active, rec(3) + "\n")
+        r = collector.collect_once(self.data, self.db)
+        self.assertEqual(r["status"], "ok", r["error"])
+        self.assertEqual(collector.list_records(self.db)[1], before_records + 1)
+
+    def test_reset_db_failure_restores_logs_and_records(self):
+        """清库事务失败：两份日志被移回，数据库原有记录仍可用。"""
+        self.write(self.rotated, rec(1) + "\n")
+        self.write(self.active, rec(2) + "\n")
+        collector.collect_once(self.data, self.db)
+        before_records = collector.list_records(self.db)[1]
+        before_offset = {
+            s["inode"]: s["offset"] for s in collector.list_file_states(self.db)
+        }
+
+        def failing_clear(conn):
+            raise sqlite3.OperationalError("database is locked (simulated)")
+
+        with mock.patch.object(collector, "_clear_all_tables", failing_clear):
+            with self.assertRaises(collector.ResetError):
+                collector.reset_all(self.db, self.data)
+
+        self.assertEqual(collector.list_records(self.db)[1], before_records)
+        self.assertEqual(
+            {s["inode"]: s["offset"] for s in collector.list_file_states(self.db)},
+            before_offset,
+        )
+        self.assertTrue(os.path.exists(self.active))
+        self.assertTrue(os.path.exists(self.rotated))
+        # 日志内容原样（未被截断/丢行），可继续增量采集
+        with open(self.rotated, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), rec(1) + "\n")
+        with open(self.active, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), rec(2) + "\n")
+        self.write(self.active, rec(3) + "\n")
+        self.assertEqual(collector.collect_once(self.data, self.db)["records_inserted"], 1)
+
+    def test_recover_preparing_crash_rolls_back_to_full_before_state(self):
+        """崩溃在“日志已移走、库未清空”：启动恢复把日志移回，记录完整。"""
+        self.write(self.rotated, rec(1) + "\n")
+        self.write(self.active, rec(2) + "\n")
+        collector.collect_once(self.data, self.db)
+        before_runs = len(collector.list_runs(self.db))
+
+        staging = os.path.join(self.data, ".reset-1-crash")
+        os.makedirs(staging)
+        os.replace(self.rotated, os.path.join(staging, ROTATED))
+        os.replace(self.active, os.path.join(staging, ACTIVE))
+        with collector.get_db(self.db) as conn:
+            collector._write_reset_state(
+                conn,
+                epoch=0,
+                phase="preparing",
+                data_dir=self.data,
+                staging=staging,
+            )
+
+        collector.recover_incomplete_reset(self.db)
+        self.assertTrue(os.path.exists(self.active))
+        self.assertTrue(os.path.exists(self.rotated))
+        self.assertFalse(os.path.isdir(staging))
+        self.assertEqual(collector.list_records(self.db)[1], 2)
+        self.assertEqual(len(collector.list_runs(self.db)), before_runs)
+        # 恢复后采集仍按原进度续接（不重记）
+        r = collector.collect_once(self.data, self.db)
+        self.assertEqual((r["status"], r["records_inserted"]), ("ok", 0))
+
+    def test_recover_committed_crash_keeps_empty_state(self):
+        """崩溃在“库已清空、暂存未删”：启动恢复清理暂存，保持空状态。"""
+        self.write(self.active, rec(1) + "\n")
+        collector.collect_once(self.data, self.db)
+        staging = os.path.join(self.data, ".reset-1-crash")
+        os.makedirs(staging)
+        os.replace(self.active, os.path.join(staging, ACTIVE))
+        conn = collector.get_db(self.db)
+        try:
+            with collector._immediate_tx(conn):
+                collector._clear_all_tables(conn)
+                collector._write_reset_state(
+                    conn, epoch=1, phase="committed", staging=staging
+                )
+        finally:
+            conn.close()
+        collector.recover_incomplete_reset(self.db)
+        self.assertFalse(os.path.isdir(staging))
+        self.assert_all_empty()
+
+    def test_repeated_reset_is_stable(self):
+        self.write(self.active, rec(1) + "\n")
+        collector.collect_once(self.data, self.db)
+        collector.reset_all(self.db, self.data)
+        for _ in range(3):
+            collector.reset_all(self.db, self.data)
+            self.assert_all_empty()
+        self.assertGreaterEqual(collector.current_epoch(self.db), 4)
+
+    def test_collect_after_interrupted_reset_does_not_create_half_state(self):
+        """重置 prepare 崩溃后直接采集：先恢复日志再采集，结果等同完整旧状态。"""
+        self.write(self.active, rec(1) + "\n" + rec(2) + "\n")
+        collector.collect_once(self.data, self.db)
+        staging = os.path.join(self.data, ".reset-1-crash")
+        os.makedirs(staging)
+        os.replace(self.active, os.path.join(staging, ACTIVE))
+        with collector.get_db(self.db) as conn:
+            collector._write_reset_state(conn, phase="preparing", staging=staging)
+        self.write(os.path.join(staging, ACTIVE), rec(3) + "\n")
+        r = collector.collect_once(self.data, self.db)
+        self.assertEqual(r["status"], "ok", r["error"])
+        self.assertEqual(r["records_inserted"], 1)
+        self.assertEqual(collector.list_records(self.db)[1], 3)
+        self.assertTrue(os.path.exists(self.active))
+
+
 class WebTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -339,6 +647,80 @@ class WebTest(unittest.TestCase):
         self.assertFalse(os.path.exists(active))
         self.assertEqual(collector.list_records(self.db)[1], 0)
         self.assertEqual(collector.list_runs(self.db), [])
+
+    def test_demo_reset_button_reports_success_and_empties_page(self):
+        active = os.path.join(self.data, ACTIVE)
+        rotated = os.path.join(self.data, ROTATED)
+        with open(rotated, "w", encoding="utf-8") as fh:
+            fh.write(rec(1) + "\n")
+        with open(active, "w", encoding="utf-8") as fh:
+            fh.write(rec(2) + "\n")
+        self.client.post("/collect")
+        self.assertIn("入库记录总数：<b>2</b>", self.client.get("/").get_data(as_text=True))
+
+        resp = self.client.post("/demo/reset", follow_redirects=True)
+        html = resp.get_data(as_text=True)
+        self.assertIn("已同时清空", html)
+        self.assertIn("入库记录总数：<b>0</b>", html)
+        self.assertIn("目录中暂无 active.ndjson", html)
+        self.assertIn("尚无采集进度", html)
+        self.assertIn("还没有执行过采集", html)
+        self.assertFalse(os.path.exists(active))
+        self.assertFalse(os.path.exists(rotated))
+        # 重复重置也保持空状态、可继续采集
+        resp = self.client.post("/demo/reset", follow_redirects=True)
+        self.assertEqual(resp.status_code, 200)
+        with open(active, "w", encoding="utf-8") as fh:
+            fh.write(rec(1) + "\n")
+        self.client.post("/collect")
+        self.assertIn("入库记录总数：<b>1</b>", self.client.get("/").get_data(as_text=True))
+
+    def test_demo_reset_failure_reports_and_keeps_state(self):
+        active = os.path.join(self.data, ACTIVE)
+        with open(active, "w", encoding="utf-8") as fh:
+            fh.write(rec(1) + "\n")
+        self.client.post("/collect")
+
+        def failing_clear(conn):
+            raise sqlite3.OperationalError("database is locked (simulated)")
+
+        with mock.patch.object(
+            self.app_module.collector, "_clear_all_tables", failing_clear
+        ):
+            resp = self.client.post("/demo/reset", follow_redirects=True)
+        html = resp.get_data(as_text=True)
+        self.assertIn("演示重置失败", html)
+        self.assertIn("入库记录总数：<b>1</b>", html)
+        self.assertTrue(os.path.exists(active))
+        self.assertEqual(collector.list_records(self.db)[1], 1)
+
+    def test_restart_page_sees_only_full_or_empty_state(self):
+        """模拟“进程重启”：新建 app，页面只会看到完整旧状态或空状态。"""
+        active = os.path.join(self.data, ACTIVE)
+        rotated = os.path.join(self.data, ROTATED)
+        with open(rotated, "w", encoding="utf-8") as fh:
+            fh.write(rec(1) + "\n")
+        with open(active, "w", encoding="utf-8") as fh:
+            fh.write(rec(2) + "\n")
+        self.client.post("/collect")
+
+        # 崩溃在 prepare 阶段（日志已移走、库未清空）
+        staging = os.path.join(self.data, ".reset-1-crash")
+        os.makedirs(staging)
+        os.replace(rotated, os.path.join(staging, ROTATED))
+        os.replace(active, os.path.join(staging, ACTIVE))
+        with collector.get_db(self.db) as conn:
+            collector._write_reset_state(
+                conn, phase="preparing", data_dir=self.data, staging=staging
+            )
+
+        # 新建 app 模拟重启（create_app 会执行启动恢复）
+        client2 = self.app_module.create_app().test_client()
+        html = client2.get("/").get_data(as_text=True)
+        self.assertIn("入库记录总数：<b>2</b>", html)
+        self.assertIn("当前大小", html)
+        self.assertTrue(os.path.exists(active))
+        self.assertTrue(os.path.exists(rotated))
 
     def test_healthz(self):
         self.assertEqual(self.client.get("/healthz").get_json(), {"status": "ok"})

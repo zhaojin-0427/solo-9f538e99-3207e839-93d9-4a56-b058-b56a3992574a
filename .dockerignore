@@ -7,3 +7,5 @@ data/*
 db/*
 .gitignore
 README.md
+data/.reset-*
+*.pyo

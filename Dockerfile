@@ -19,4 +19,4 @@ RUN mkdir -p /data /instance
 EXPOSE 8000
 
 # 容器内用 Flask 内置服务器即可满足演示/质控场景；生产可换 gunicorn
-CMD ["python", "-I", "run.py"]
+CMD ["python", "run.py"]

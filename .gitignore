@@ -7,3 +7,6 @@ data/active.ndjson.1
 data/.half.json
 .venv/
 .pytest_cache/
+data/.reset-*
+data/active.ndjson.reset-kept-*
+data/active.ndjson.1.reset-kept-*
